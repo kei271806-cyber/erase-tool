@@ -200,6 +200,23 @@ input[type=range] { flex: 1; accent-color: var(--accent); height: 4px; }
 .solve-btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
 .solve-btn svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
 
+/* ── Auto erase ── */
+.auto-btn {
+  width: 100%; padding: 12px; border-radius: var(--r);
+  background: var(--surface); color: var(--ink); border: 1.5px solid var(--border2);
+  font-size: 14px; font-weight: 700; font-family: var(--font);
+  cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 8px;
+  transition: all 0.2s; margin-top: 10px;
+}
+.auto-btn:hover { background: var(--surface2); border-color: var(--ink2); }
+.auto-btn:active { transform: scale(0.98); }
+.auto-btn:disabled { opacity: 0.45; cursor: not-allowed; transform: none; }
+.auto-btn svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.auto-progress {
+  font-size: 12px; color: var(--ink3); text-align: center;
+  font-family: var(--mono); padding: 6px 0; display: none;
+}
+
 /* ── Hint ── */
 .hint {
   font-size: 12px; color: var(--ink3); text-align: center;
@@ -283,6 +300,13 @@ input[type=range] { flex: 1; accent-color: var(--accent); height: 4px; }
           <span class="brush-val" id="brushVal">22px</span>
         </div>
       </div>
+
+      <!-- Auto erase -->
+      <button class="auto-btn" id="autoEraseBtn" onclick="autoErase()">
+        <svg viewBox="0 0 24 24"><path d="M12 2a10 10 0 1 0 10 10"/><path d="M9 9l6 6M15 9l-6 6"/><path d="M18 2v6h6"/></svg>
+        AIで手書きを自動消去
+      </button>
+      <div class="auto-progress" id="autoProgress">手書き領域を検出中...</div>
 
       <!-- Solve button -->
       <button class="solve-btn" id="solveBtn" onclick="solveHomework()">
@@ -475,6 +499,102 @@ function resetImage() {
   document.getElementById('answerToggle').style.display = 'none';
   hasAnswer = false;
   setStep(2);
+}
+
+// ── Auto Erase ──
+async function autoErase() {
+  if (!apiKey) { openModal(); return; }
+  const btn = document.getElementById('autoEraseBtn');
+  const prog = document.getElementById('autoProgress');
+  btn.disabled = true;
+  prog.style.display = 'block';
+  prog.textContent = '画像を解析中... (数秒かかります)';
+
+  try {
+    // 元画像を送る（消去前）
+    const tmpCanvas = document.createElement('canvas');
+    tmpCanvas.width = mainCanvas.width;
+    tmpCanvas.height = mainCanvas.height;
+    const tmpCtx = tmpCanvas.getContext('2d');
+    tmpCtx.drawImage(originalImage, 0, 0, mainCanvas.width, mainCanvas.height);
+    const imageData = tmpCanvas.toDataURL('image/jpeg', 0.88).split(',')[1];
+
+    const prompt = `この画像には印刷されたテキスト（問題文）と手書きの書き込み（答えや落書き）が混在しています。
+手書きで書かれた部分（鉛筆・ペン・マーカーなどで書かれた回答・メモ・落書き）の位置を矩形で特定してください。
+
+画像サイズは幅${mainCanvas.width}px、高さ${mainCanvas.height}pxです。
+
+以下のJSON形式のみで回答してください（説明文は不要）：
+{"regions":[{"x":左端px,"y":上端px,"w":幅px,"h":高さpx},…]}
+
+手書き領域が見つからない場合は {"regions":[]} を返してください。
+矩形は少し余白を持たせて、手書き部分を確実に含むようにしてください。`;
+
+    const res = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': apiKey,
+        'anthropic-version': '2023-06-01'
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 1000,
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: imageData } },
+            { type: 'text', text: prompt }
+          ]
+        }]
+      })
+    });
+
+    const data = await res.json();
+    if (!data.content?.[0]?.text) throw new Error('APIエラー: ' + JSON.stringify(data.error));
+
+    const raw = data.content[0].text.trim();
+    const jsonMatch = raw.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) throw new Error('座標データを取得できませんでした');
+
+    const parsed = JSON.parse(jsonMatch[0]);
+    const regions = parsed.regions || [];
+
+    if (regions.length === 0) {
+      prog.textContent = '手書き領域が見つかりませんでした';
+      btn.disabled = false;
+      return;
+    }
+
+    // ヒストリーに保存
+    saveSnap();
+
+    // 検出された領域を白塗り（アニメーション付き）
+    prog.textContent = `${regions.length}箇所の手書きを消去中...`;
+    for (let i = 0; i < regions.length; i++) {
+      const r = regions[i];
+      const x = Math.max(0, Math.round(r.x));
+      const y = Math.max(0, Math.round(r.y));
+      const w = Math.min(mainCanvas.width - x, Math.round(r.w));
+      const h = Math.min(mainCanvas.height - y, Math.round(r.h));
+      if (w > 0 && h > 0) {
+        // フェードイン白塗り
+        mainCtx.fillStyle = 'rgba(255,255,255,0.95)';
+        mainCtx.fillRect(x, y, w, h);
+        prog.textContent = `消去中... ${i+1}/${regions.length}`;
+        await new Promise(r => setTimeout(r, 80));
+      }
+    }
+
+    prog.textContent = `✓ ${regions.length}箇所の手書きを消去しました`;
+    setTimeout(() => { prog.style.display = 'none'; }, 3000);
+
+  } catch(e) {
+    prog.textContent = 'エラー: ' + e.message;
+    setTimeout(() => { prog.style.display = 'none'; }, 4000);
+  }
+
+  btn.disabled = false;
 }
 
 // ── AI Solve ──
